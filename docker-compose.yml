@@ -1,0 +1,111 @@
+version: '3.9'
+services:
+
+  # Storage layer of the Data Lake.
+  datalake_s3:
+    hostname: datalake-s3
+    image: 'minio/minio'
+    container_name: datalake-s3
+    ports:
+      - '127.0.0.1:9000:9000'
+      - '9001:9001'
+    volumes:
+      - ./data/s3:/data
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=minio123
+    command: server /data --console-address ":9001"
+    networks:
+      - open_data_stack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Set up the storage on first run.
+  datalake_s3_setup:
+    image: minio/mc
+    container_name: datalake-s3-setup
+    hostname: datalake-s3-setup
+    environment:
+      - AWS_ACCESS_KEY_ID=minio
+      - AWS_SECRET_ACCESS_KEY=minio123
+      - AWS_REGION=us-east-1
+    networks:
+      - open_data_stack
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc config host add minio http://datalake-s3:9000 minio minio123) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb minio/bronze;
+      /usr/bin/mc mb minio/silver;
+      /usr/bin/mc policy set public minio/bronze;
+      /usr/bin/mc policy set public minio/s3;
+      exit 0;
+      "
+    depends_on:
+      datalake_s3:
+        condition: service_healthy
+
+  # Metastore and Gold-tier of the Data Lake.
+  datalake_postgresql:
+    image: postgres
+    hostname: datalake-postgresql
+    container_name: datalake-postgresql
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data/pgdata
+      - ./conf/postgresql/initdb:/docker-entrypoint-initdb.d
+    networks:
+      - open_data_stack
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d postgres -U admin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # UI for the PostgreSQL DB.
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    ports:
+      - '8010:80'
+    volumes:
+      - ./data/pgadmin4:/var/lib/pgadmin
+      - ./conf/pgadmin4/servers.json:/pgadmin4/servers.json
+    depends_on:
+      - datalake_postgresql
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=pgadmin@ouvert.org
+      - PGADMIN_DEFAULT_PASSWORD=pgadmin
+    networks:
+      - open_data_stack
+
+  # SQL Engine for the Data Lake.
+  trino:
+    image: trinodb/trino:406
+    # image: trinodb/trino
+    container_name: trino
+    volumes:
+      - ./conf/trino/etc:/etc/trino
+      - ./data/trino:/var/trino/data
+    ports:
+      - '8060:8060' # Trino
+      - '8063:8063' # Trino
+    networks:
+      open_data_stack:
+        aliases:
+          - trino
+    depends_on:
+      datalake_s3:
+        condition: service_healthy
+
+networks:
+  open_data_stack:
+    driver: bridge
+    name: open_data_stack
+    attachable: true
